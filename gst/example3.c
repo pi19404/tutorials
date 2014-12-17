@@ -1,79 +1,173 @@
 #include <gst/gst.h>
 
 
+/* Structure to contain all our information, so we can pass it to callbacks */
+typedef struct _CustomData {
+  GstElement *pipeline;
+  GstElement *source;
+  GstElement *typefinder;
+  GstElement *demux;
+  GstElement *decoder;
+  GstElement *convert;
+  GstElement *sink;
+  
+} CustomData;
+
 
 static void
-on_pad_added (GstElement * element, GstPad * pad, gpointer data)
+pad_added_handler (GstElement *element,
+              GstPad     *pad,
+              CustomData    *data)
 {
   GstPad *sinkpad;
-  GstElement *decoder = (GstElement *) data;
 
-  /* We can now link this pad with the decoder sink pad */
+  /* We can now link this pad with the vorbis-decoder sink pad */
   g_print ("Dynamic pad created, linking demuxer/decoder\n");
 
-  sinkpad = gst_element_get_static_pad (decoder, "sink");
+  /* Get the sink pad of next element */
+  sinkpad = gst_element_get_static_pad (data->decoder, "sink");
 
-  gst_pad_link (pad, sinkpad);
+  /*link the source and sink pads */
+  gst_pad_link (pad,sinkpad);
 
   gst_object_unref (sinkpad);
+//  gst_element_set_state (data->decoder, GST_STATE_PLAYING);
 }
+
+static void
+cb_typefound (GstElement *typefind,
+	      guint       probability,
+	      GstCaps    *caps,
+	      CustomData    *data)
+{
+  
+  gchar *type;
+  
+  type = gst_caps_to_string (caps);
+  g_print ("Media type %s found, probability %d%%  : %d\n", type, probability,strcmp(type,"video/webm"));
+ 
+ 
+  if(!strcmp(type,"video/webm"))
+  {
+
+	  g_print("Recognized video/webm video stream \n");
+	  data->demux=gst_element_factory_make ("matroskademux", "demux");
+	  data->decoder=gst_element_factory_make ("vp8dec", "decoder");
+
+	  gst_bin_add(GST_BIN (data->pipeline),data->demux);
+          gst_bin_add(GST_BIN (data->pipeline),data->decoder);
+
+	  if (gst_element_link (data->typefinder, data->demux) !=TRUE || gst_element_link_many (data->decoder, data->convert,NULL) !=TRUE) {
+	  g_printerr ("Elements could not be linked.\n");
+	  gst_object_unref (data->pipeline); 
+	  return ;
+	  }
+
+  /* Connect to the pad-added signal */
+  g_signal_connect (data->demux, "pad-added", G_CALLBACK (pad_added_handler), data);
+
+
+  }
+g_free (type);
+}
+
+
+
    
 int main(int argc, char *argv[]) {
-  GstElement *pipeline,*source,*sink,*decoder,*filter,*demux,*queue;
+  CustomData data;
   GstBus *bus;
   GstMessage *msg;
+  GstStateChangeReturn ret;
+  gboolean terminate = FALSE;
    
   /* Initialize GStreamer */
   gst_init (&argc, &argv);
-   
 
+ /* Create the elements */
+  data.source = gst_element_make_from_uri (GST_URI_SRC,"file:/home/pi19404/Downloads/sample.webm" ,NULL);
 
-source   = gst_element_make_from_uri (GST_URI_SRC,"file:/home/pi19404/Downloads/sample.webm" ,NULL);
-filter = gst_element_factory_make("ffmpegcolorspace","colorspace");
-sink = gst_element_factory_make ("autovideosink", "sink");
-demux=gst_element_factory_make ("matroskademux", "demux");
-queue=gst_element_factory_make ("queue", "q1");
-decoder=gst_element_factory_make ("vp8dec", "decoder");
+  /* create the typefind element */
+  data.typefinder = gst_element_factory_make ("typefind", "typefind");
+  g_assert (data.typefinder != NULL);
 
-//g_object_set (G_OBJECT (source), "location", "/home/pi19404/Downloads/sample.webm", NULL);
+  g_print("GStreamer Source Type %s \n",GST_ELEMENT_NAME (data.source));
 
+  data.sink = gst_element_factory_make ("autovideosink" ,"sink");
+
+  data.convert = gst_element_factory_make ("ffmpegcolorspace" ,"filter");
 
 
 /* Create the empty pipeline */
-pipeline = gst_pipeline_new ("test-pipeline");
-
+data.pipeline = gst_pipeline_new ("test-pipeline");
+if (!data.pipeline) {
+    g_printerr ("Not all elements could be created.\n");
+    return -1;
+  }
 
 /* Adding Elements to List */
-gst_bin_add_many (GST_BIN (pipeline), source,demux,queue,decoder,filter,sink, NULL);
+gst_bin_add_many (GST_BIN (data.pipeline),data.source,data.typefinder,data.convert,data.sink,NULL);
+
+if (gst_element_link (data.source, data.typefinder)!=TRUE || gst_element_link (data.convert, data.sink)!=TRUE) {
+    g_printerr ("Elements could not be linked.\n");
+    gst_object_unref (data.pipeline);
+    return -1;
+  }
+
+/* Connect to the pad-added signal */
+g_signal_connect (data.typefinder, "have-type", G_CALLBACK (cb_typefound), &data);
 
 
-
-if (gst_element_link (source, demux) !=TRUE || gst_element_link_many (decoder, filter,sink,NULL) !=TRUE) {
-  g_printerr ("Elements could not be linked.\n");
-  gst_object_unref (pipeline);
-  return -1;
-}
-
-g_signal_connect(G_OBJECT(demux),"pad-added",G_CALLBACK(on_pad_added),decoder);
-
-   
 /* Start playing */
-int ret = gst_element_set_state (pipeline, GST_STATE_PLAYING);
+ret = gst_element_set_state (data.pipeline, GST_STATE_PLAYING);
 if (ret == GST_STATE_CHANGE_FAILURE) {
   g_printerr ("Unable to set the pipeline to the playing state.\n");
-  gst_object_unref (pipeline);
+  gst_object_unref (data.pipeline);
   return -1;
 }
-   
-  /* Wait until error or EOS */
-  bus = gst_element_get_bus (pipeline);
+
+
+
+ /* Wait until error or EOS */
+  bus = gst_element_get_bus (data.pipeline);
   msg = gst_bus_timed_pop_filtered (bus, GST_CLOCK_TIME_NONE, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+   
+/* Parse message */
+if (msg != NULL) {
+  GError *err;
+  gchar *debug_info;
+   
+  switch (GST_MESSAGE_TYPE (msg)) {
+    case GST_MESSAGE_ERROR:
+      gst_message_parse_error (msg, &err, &debug_info);
+      g_printerr ("Error received from element %s: %s\n", GST_OBJECT_NAME (msg->src), err->message);
+      g_printerr ("Debugging information: %s\n", debug_info ? debug_info : "none");
+      g_clear_error (&err);
+      g_free (debug_info);
+      break;
+    case GST_MESSAGE_EOS:
+      g_print ("End-Of-Stream reached.\n");
+      break;
+    default:
+      /* We should not reach here because we only asked for ERRORs and EOS */
+      g_printerr ("Unexpected message received.\n");
+      break;
+  }
+  gst_message_unref (msg);
+}
    
   /* Free resources */
   if (msg != NULL)
     gst_message_unref (msg);
   gst_object_unref (bus);
-  gst_element_set_state (pipeline, GST_STATE_NULL);
-  gst_object_unref (pipeline);
+  gst_element_set_state (data.pipeline, GST_STATE_NULL);
+  gst_object_unref (data.pipeline);
   return 0;
+
 }
+
+
+
+
+   
+ 
